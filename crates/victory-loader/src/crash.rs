@@ -506,6 +506,32 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    // `VICTORY_CRASH_MEMORY=1`: what the registers point at (eight qwords
+    // each, where readable), and what each of those eight points at in
+    // turn where it is a pointer: the object a fault was reading through.
+    if code == EXCEPTION_ACCESS_VIOLATION && std::env::var_os("VICTORY_CRASH_MEMORY").is_some_and(|v| v == "1") {
+        let registers = [
+            ("rax", context.Rax),
+            ("rbx", context.Rbx),
+            ("rcx", context.Rcx),
+            ("rdx", context.Rdx),
+            ("rsi", context.Rsi),
+            ("rdi", context.Rdi),
+            ("r8", context.R8),
+            ("r13", context.R13),
+            ("r14", context.R14),
+            ("r15", context.R15),
+        ];
+        for (name, value) in registers {
+            let Some(words) = peek(value as usize) else { continue };
+            line(format!("  [{name}] {words:x?}"));
+            for (k, &w) in words.iter().enumerate().take(4) {
+                if let Some(inner) = peek(w as usize) {
+                    line(format!("    [[{name}+{:#x}]] = [{w:#x}] {inner:x?}", 8 * k));
+                }
+            }
+        }
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
@@ -621,6 +647,33 @@ fn module_of(address: usize) -> Option<String> {
 /// broke (with the module, for an image's pages). Each points at a different
 /// cause: a wild pointer, an allocation whose commit failed, a stack
 /// overrun, a write to code or constants.
+/// Eight qwords at `address`, if all 64 bytes are committed, readable
+/// memory that is no guard page.
+fn peek(address: usize) -> Option<[u64; 8]> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if address < 0x1_0000 || address % 8 != 0 {
+        return None;
+    }
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    let end = info.BaseAddress as usize + info.RegionSize;
+    if n == 0
+        || info.State != MEM_COMMIT
+        || info.Protect & PAGE_GUARD != 0
+        || info.Protect & 0xff == PAGE_NOACCESS
+        || address + 64 > end
+    {
+        return None;
+    }
+    // SAFETY: 64 committed, readable bytes (checked above); another thread
+    // may free them meanwhile, which a crash report accepts.
+    Some(unsafe { (address as *const [u64; 8]).read_unaligned() })
+}
+
 fn memory_at(address: usize) -> String {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,

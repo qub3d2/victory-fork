@@ -243,6 +243,15 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     ask_run(j, b);
 }
 
+/// Diagnostics (`VICTORY_WATCH_ALL=1`): every page asked about counts as
+/// written, so every refresh of a host copy takes all of its title memory
+/// again. Slow; it tells a stale copy (a write the watch did not see) from
+/// other faults.
+fn all_written() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_ALL").is_some_and(|v| v == "1"))
+}
+
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
@@ -279,6 +288,11 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     for k in 0..count {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
+    }
+    if all_written() {
+        for page in first..last {
+            j.written.insert(page, now);
+        }
     }
     true
 }
@@ -360,6 +374,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
+    }
+    if all_written() {
+        for page in first..last {
+            j.written.insert(page, now);
+        }
     }
     Some((
         now,

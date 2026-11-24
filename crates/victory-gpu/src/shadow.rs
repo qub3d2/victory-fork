@@ -2405,6 +2405,8 @@ impl Shadow {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
+                self.check_fresh(from, to);
+                #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
@@ -2422,6 +2424,58 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Diagnostics (`VICTORY_WATCH_CHECK=1`): after a refresh by written
+    /// pages, whether the copy of `[from, to)` is what title memory holds;
+    /// a page that is not was written without the watch seeing it.
+    #[cfg(feature = "diagnostics")]
+    fn check_fresh(&self, from: usize, to: usize) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_CHECK").is_some_and(|v| v == "1")) {
+            return;
+        }
+        static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return;
+        }
+        let mut title = vec![0u8; to - from];
+        crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+        // SAFETY: inside the mapping, as in `copy`.
+        let ours = unsafe { std::slice::from_raw_parts(self.data.add(from - start), to - from) };
+        // A page that differs may only have been written since the refresh
+        // (the title's threads run on): it counts when it differs again at
+        // a later refresh, with the same bytes on both sides as before.
+        static SEEN: Mutex<BTreeMap<(usize, usize), (u64, u64)>> = Mutex::new(BTreeMap::new());
+        let sum = |b: &[u8]| b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ u64::from(x)).wrapping_mul(0x100_0000_01b3));
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mut at = 0;
+        while at < title.len() {
+            let n = (PAGE - (from + at) % PAGE).min(title.len() - at);
+            let key = (start, (from + at) / PAGE);
+            let (t, o) = (&title[at..at + n], &ours[at..at + n]);
+            if let Some(k) = (0..n).find(|&k| t[k] != o[k]) {
+                let sums = (sum(t), sum(o));
+                if seen.insert(key, sums) == Some(sums) && NOTED.fetch_add(1, Ordering::Relaxed) < 400 {
+                    let differing = (0..n).filter(|&k| t[k] != o[k]).count();
+                    tracing::warn!(
+                        address = format_args!("{:#x}", from + at + k),
+                        differing,
+                        title = ?&t[k..(k + 8).min(n)],
+                        ours = ?&o[k..(k + 8).min(n)],
+                        buffer = format_args!("{:#x}+{:#x}", start, end - start),
+                        committed = crate::texture::committed((from + at) as *const u8, n),
+                        title_zero = t.iter().all(|&x| x == 0),
+                        "check: a host copy is not what title memory holds, at two refreshes with the same bytes"
+                    );
+                }
+            } else {
+                seen.remove(&key);
+            }
+            at += n;
+        }
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
