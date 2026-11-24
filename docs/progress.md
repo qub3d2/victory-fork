@@ -12,6 +12,7 @@ Test machine: Windows 11, NVIDIA RTX 4070 (waves of 32 lanes), the Series X prof
 | Area | State |
 |------|-------|
 | Boot, menus, opening cutscene | work; the cutscene plays lit |
+| Intro movie | a new picture every frame again (it showed one of three pictures in turn, flashing) |
 | First gameplay scene | renders lit where the sun reaches; characters, hair, sky, fog, props |
 | Light in shadow | still missing: everything the sun does not hit is black |
 | Frame time in the world | 250 to 310 ms with `VICTORY_RELAY=2` on a warm shader cache; 360 to 450 ms without |
@@ -31,10 +32,23 @@ pipelines are still being made; the second run draws them correctly.
    shared memory at an address every lane holds is the same in every lane, so a first-lane read
    of it inside a lane branch needs no exchange between the two host waves of a console wave.
    The ray-tracing structure builder's last three programs translate with it (52 of 52).
-3. **A GPU test for that form**: 512 threads in eight console waves, each wave adding the
-   totals of the waves before it; compared with the closed form on the card.
+3. **GPU tests for that form**: 512 threads in eight console waves, the whole prefix sum (five
+   swizzle steps within each 32 lanes, lane 31's sum added by the upper half, the waves'
+   totals through shared memory); compared with the sum on the CPU.
+4. **Two pull requests of the fork, taken as they are** (their authors' commits, cherry-picked):
+   the texture guard sees writes through every view of its pages (fork PR #115), which is what
+   fixes the intro movie: a plane of the movie got its new picture only on its turn every
+   eighth frame; and numbered copies of title memory are tracked per command list (fork PR
+   #205).
+5. **Diagnostics for the structure builder** (off unless asked for): its stages run dry (all,
+   from the k-th on, or one: everything the host does around a dispatch but the dispatch), a
+   log of every piece of title memory that takes shaders' bytes, a note of each new content of
+   a big title texture, and the resources each present names.
+6. **Opt-in** (`VICTORY_ROOT_BY_ADDRESS=1`): a program with a spilled user-data table makes its
+   raw accesses through the buffer descriptors it builds around root views by address, not
+   through one view of the copy the address lies in. It has not changed a run's outcome yet.
 
-Tests: 110 in `victory-gpu` and 211 in `victory-shader` pass on the test machine.
+Tests: 114 in `victory-gpu`, 212 in `victory-shader` and 95 in `victory-hle` pass on the test machine.
 
 ## Light in shadow: where it stands
 
@@ -46,17 +60,21 @@ its stages.
   off and about 340 of its dispatches a frame were dropped.
 - With change 2 every builder program has a host pipeline, and with `VICTORY_BVH_BUILDER=1` the
   builder runs, for the first time.
-- **The title then stops within seconds, in its own code.** With the builder's stores kept out
-  of title memory (`VICTORY_BVH_QUARANTINE=1`) it reads results it never got; with them
-  written back, values in its registers are bounding-box bit patterns, so some stage stores
-  out of place or with wrong bounds. The builder therefore stays off by default, and normal
-  runs are unchanged.
+- **The title then stops within seconds, in its own code**, reading bounding-box bit patterns
+  where it expects a pointer (the fork's issue #16 is the same stop, seen on other 32-lane
+  cards). The builder therefore stays off by default, and normal runs are unchanged.
+- With every stage dry the title runs on: what the host does around the builder is not the
+  cause, what its stages write is.
+- Bisecting the stages by the order of their first dispatch: the title survives the first 18
+  and stops once the 19th, the builder's largest program, also runs. (A later stage may be
+  wrong as well.)
+- No change from: the copy-back on the submitting thread instead of the relay, fork PR #205,
+  change 6. No access was lost to a page without a host copy in any of these runs.
 
 Next:
 
-1. Find the builder stage that stores out of place. Known gap to check first: an access to a
-   title page that has no host copy is lost (a read gives zero, a store is dropped), and what a
-   stage reaches only through pointers it reads out of memory is not made ready beforehand.
+1. That one stage: what it is given, and whether its stores cover the records the title then
+   reads.
 2. A shader was seen taking the address of a buffer view that is not a buffer view (it reads
    0): find which trace program and which view.
 3. Then the trace and shading programs, which have not run end to end either.
