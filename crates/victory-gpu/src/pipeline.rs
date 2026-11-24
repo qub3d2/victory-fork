@@ -279,6 +279,55 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// Diagnostics: whether a dispatch of the builder's pipeline `this` is left
+/// out at the last step (everything the host does around it still
+/// happens). `VICTORY_BVH_DRY=1`: every stage. `VICTORY_BVH_DRY_FROM=<k>`:
+/// the stages from the k-th on, counted from 0 in the order the title
+/// first dispatches them (each is logged with its number), to find the
+/// first stage whose output the title does not survive.
+/// `VICTORY_BVH_DRY_ONLY=<k>`: that stage alone.
+#[cfg(windows)]
+pub(crate) fn builder_dry(this: This) -> bool {
+    static MODE: OnceLock<(bool, Option<usize>, Option<usize>)> = OnceLock::new();
+    static ORDER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    if !is_builder(this) {
+        return false;
+    }
+    let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse().ok());
+    let (all, from, only) = *MODE.get_or_init(|| {
+        (
+            std::env::var_os("VICTORY_BVH_DRY").is_some_and(|v| v == "1"),
+            number("VICTORY_BVH_DRY_FROM"),
+            number("VICTORY_BVH_DRY_ONLY"),
+        )
+    });
+    if all {
+        return true;
+    }
+    if from.is_none() && only.is_none() {
+        return false;
+    }
+    let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    let at = match order.iter().position(|&p| p == this as usize) {
+        Some(at) => at,
+        None => {
+            order.push(this as usize);
+            let at = order.len() - 1;
+            let name = host_pipeline(this).map(|p| p.name.clone()).unwrap_or_default();
+            let dry = from.is_some_and(|k| at >= k) || only == Some(at);
+            tracing::info!(stage = at, dry, name, "a stage of the structure builder, in the order of first dispatch");
+            at
+        }
+    };
+    from.is_some_and(|k| at >= k) || only == Some(at)
+}
+
+/// Whether the builder has run whole at least once (diagnostics).
+#[cfg(windows)]
+pub(crate) fn builder_whole() -> bool {
+    BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]

@@ -826,6 +826,12 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(frame) {
+            // SAFETY: the plane lists `count` resources.
+            let all: Vec<This> = (0..plane.count as usize).map(|i| unsafe { *plane.resources.add(i) }).collect();
+            tracing::info!(frame, planes, token = plane.token, resources = ?all, "present: the plane's resources");
+        }
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
         let shown = host.present(texture, state, frame);

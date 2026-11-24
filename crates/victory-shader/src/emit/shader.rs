@@ -82,6 +82,14 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// A `Root::Other` user-data dword the host computes: the title address a
+/// root view is set to, low dword (and with 1 added, the bits above), slot
+/// the root parameter. A program with a spilled user-data table builds its
+/// buffer descriptors around such addresses with no size, and what it reads
+/// and writes through them may lie in any number of the host's copies of
+/// title memory: its raw accesses go by address ([`SLOT_MEMORY`]) from
+/// here, not through one view of the copy the address is in.
+pub const USER_ROOT_ADDRESS: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

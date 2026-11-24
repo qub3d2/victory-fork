@@ -809,6 +809,22 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        // `VICTORY_NOTE_DETILE=<bytes>` (diagnostics): each new content of a
+        // title texture of at least that many bytes, with the frame it is
+        // found in (a movie's planes: how often a new picture arrives).
+        #[cfg(feature = "diagnostics")]
+        {
+            static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+            let min = *MIN.get_or_init(|| std::env::var("VICTORY_NOTE_DETILE").ok().and_then(|v| v.parse().ok()));
+            if min.is_some_and(|m| tiled.len() >= m) {
+                tracing::info!(
+                    frame = crate::queue::presented() + 1,
+                    memory = format_args!("{:p}", self.memory),
+                    bytes = tiled.len(),
+                    "detile: a title texture has new content"
+                );
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(

@@ -4157,6 +4157,13 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = declared_writes(runs);
+        if crate::shadow::note_back() {
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .collect();
+            tracing::info!(submission = this_submission, lists = runs.len(), ?pipelines, "back: a submission's writes follow");
+        }
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);

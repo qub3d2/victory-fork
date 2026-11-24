@@ -5916,6 +5916,49 @@ impl<'a> Lower<'a> {
         Ok(out)
     }
 
+    /// The root parameter of a root view whose raw accesses go by address
+    /// (`shader.rs` `USER_ROOT_ADDRESS`): a buffer descriptor a program with
+    /// a spilled user-data table (the console's structure builder) built
+    /// around a root view. Only with `VICTORY_ROOT_BY_ADDRESS=1`: a root
+    /// view is bound into the one host copy its address is in (a 4 MiB
+    /// window for memory outside buffers) and cut off at that copy's end,
+    /// which this form is not; but a run with it stopped the same way as
+    /// without (the title's crash once the builder runs), so it has shown
+    /// nothing yet and stays off.
+    fn by_address(&self, src: &Source) -> Option<crate::native::RootParam> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        let rp = *self.x.native.layout.get(address.param)?;
+        let kind = self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
+        (rp.root == RootType::Descriptor
+            && matches!(kind, Some(ResourceType::Srv | ResourceType::Uav))
+            && crate::spill::is_spilled(self.x.native)
+            && *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_BY_ADDRESS").is_some_and(|v| v == "1")))
+        .then_some(rp)
+    }
+
+    /// The raw view and the byte in it for a raw buffer access at `byte` of
+    /// what `src` names: the descriptor's own view, or for [`Self::by_address`]
+    /// the host's copy of title memory at the root view's address plus
+    /// `byte`.
+    fn raw_at(&mut self, site: Site, src: &'a Source, byte: V, u: u32, guard: Option<V>) -> Result<(V, V), Why> {
+        let Some(rp) = self.by_address(src) else {
+            return Ok((self.handle(site, src, false, (11 | u, 0))?, byte));
+        };
+        use super::shader::USER_ROOT_ADDRESS;
+        let lo = self.host_word(RootType::Other(USER_ROOT_ADDRESS), rp.slot, 0);
+        let hi = self.host_word(RootType::Other(USER_ROOT_ADDRESS + 1), rp.slot, 0);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let sum = self.s.m.bin(c, Bin::Add, lo, byte);
+        let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
+        let one = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
+        let hi = self.s.m.bin(c, Bin::Add, hi, one);
+        Ok(self.memory(sum, hi, guard))
+    }
+
     /// The byte offset a buffer descriptor built around a root descriptor adds
     /// (constant and computed parts); none for other descriptors.
     fn built_offset(&mut self, src: &Source) -> Result<(u32, Option<V>), Why> {
@@ -5925,7 +5968,8 @@ impl<'a> Lower<'a> {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
                 };
-                if let Some(bias) = self.root_bias(address.param) {
+                let bias = if self.by_address(src).is_some() { None } else { self.root_bias(address.param) };
+                if let Some(bias) = bias {
                     x = Some(match x {
                         Some(d) => self.s.m.bin(self.cur, Bin::Add, d, bias),
                         None => bias,
@@ -9934,7 +9978,8 @@ impl<'a> Lower<'a> {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    let (h, byte) = self.raw_at(site, src, byte, u, guard)?;
+                    (h, [byte, iu, iu])
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -9944,7 +9989,10 @@ impl<'a> Lower<'a> {
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => {
+                    let (h, byte) = self.raw_at(site, src, off, u, guard)?;
+                    (h, [byte, iu, iu])
+                }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -10022,7 +10070,8 @@ impl<'a> Lower<'a> {
                     // A raw buffer (stride 1) written by index: the index is the byte.
                     Some(index) if used.is_some_and(|u| u.stride == 1) => {
                         let byte = self.s.m.bin(c, Bin::Add, index, off);
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        let (h, byte) = self.raw_at(site, src, byte, u, guard)?;
+                        args.push(h);
                         args.extend([byte, iu]);
                     }
                     Some(index) => {
@@ -10034,8 +10083,9 @@ impl<'a> Lower<'a> {
                         args.extend([index, off]);
                     }
                     None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
+                        let (h, byte) = self.raw_at(site, src, off, u, guard)?;
+                        args.push(h);
+                        args.extend([byte, iu]);
                     }
                 }
                 args.extend(&vals);
@@ -10089,7 +10139,8 @@ impl<'a> Lower<'a> {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (h, byte) = self.raw_at(site, src, byte, u, guard)?;
+                    let c = self.cur;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -10115,14 +10166,15 @@ impl<'a> Lower<'a> {
                     )
                 }
                 None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let (h, byte) = self.raw_at(site, src, off, u, guard)?;
+                    let c = self.cur;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, off, iu, mask, align],
+                        &[h, byte, iu, mask, align],
                     )
                 }
             }

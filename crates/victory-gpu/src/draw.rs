@@ -679,7 +679,7 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -695,6 +695,17 @@ impl State {
                 }),
                 _ => 0,
             };
+        }
+        if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
+            // The title address the root view is set to.
+            let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => address,
+                _ => {
+                    once!(slot, "a shader takes the address of a root view that is not set: it reads 0");
+                    0
+                }
+            };
+            return if kind == USER_ROOT_ADDRESS { address as u32 } else { (address >> 32) as u32 };
         }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
             once!(kind, "a shader reads a host value this build does not know");
@@ -1739,6 +1750,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // `VICTORY_BVH_DRY=1` (diagnostics): everything the host does for a
+        // stage of the structure builder but the dispatch itself, to tell
+        // what its shaders write from what the host does around them.
+        if crate::pipeline::builder_dry(self.pipeline as This) {
+            return;
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2473,6 +2490,10 @@ impl State {
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
+        }
+        if kind == DISPATCH && crate::pipeline::builder_dry(self.pipeline as This) {
+            crate::indirect::done(list, &bounded);
+            return true;
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.

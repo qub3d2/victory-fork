@@ -1949,6 +1949,20 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
+                    if note_back() {
+                        let head: Vec<u32> = title
+                            .chunks_exact(4)
+                            .take(6)
+                            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                            .collect();
+                        tracing::info!(
+                            address = format_args!("{:#x}", start + at),
+                            n,
+                            window = self.window,
+                            head = format_args!("{head:x?}"),
+                            "back: shaders' bytes into title memory"
+                        );
+                    }
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
@@ -2566,6 +2580,20 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
+                if note_back() {
+                    let head: Vec<u32> = title
+                        .chunks_exact(4)
+                        .take(6)
+                        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                        .collect();
+                    tracing::info!(
+                        address = format_args!("{:#x}", start + at),
+                        n,
+                        card = true,
+                        head = format_args!("{head:x?}"),
+                        "back: shaders' bytes into title memory"
+                    );
+                }
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
@@ -3183,4 +3211,14 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// `VICTORY_NOTE_BACK=1` (diagnostics): once the ray-tracing structure builder
+/// runs, every piece of title memory that takes shaders' bytes is logged
+/// (address, bytes, its first dwords), after a line naming the submission's
+/// pipelines (`Host::execute`): which submission wrote where.
+pub(crate) fn note_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NOTE_BACK").is_some_and(|v| v == "1"))
+        && crate::pipeline::builder_whole()
 }
