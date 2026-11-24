@@ -475,6 +475,10 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                 {
                     v.src.clone()
                 }
+                // A read of the group's shared memory at an address every lane holds alike
+                // gives every lane the same dword (a prefix sum over the group's waves reads
+                // each earlier wave's total that way, then takes it from the first lane).
+                Fields::Ds { addr: Some(a), gds: false, .. } if name == "ds_read_b32" => vec![*a],
                 _ => continue,
             };
             if st.guards[b][i].is_some() {
