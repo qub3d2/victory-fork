@@ -6203,8 +6203,10 @@ impl<'a> Lower<'a> {
     /// numbers (HLSL's `GetDimensions` of a buffer reads the record count,
     /// dword 2, and the stride field of dword 1). Each dword comes from the
     /// host's table of console descriptors by heap slot
-    /// ([`super::shader::SLOT_WORDS`]); dword 1 keeps its stride field only
-    /// (its address bits are the console's and mean nothing here).
+    /// ([`super::shader::SLOT_WORDS`]), whole: the table holds the title
+    /// address (dwords 0 and 1 bits 0..15), which is the address the
+    /// program's own memory accesses go by, and a program that builds an
+    /// address from them needs its high bits.
     fn words_from_table(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const WHY: Why = "a descriptor read only as data";
         let address = self.scalar.get(&site).copied().ok_or(WHY)?;
@@ -6239,11 +6241,7 @@ impl<'a> Lower<'a> {
                 &[h, byte, iu, mask, align],
             );
             let f = self.s.m.extract(c, r, 0);
-            let mut v = self.as_int(f);
-            if word == 1 {
-                let field = self.s.m.i32(0x3FFF_0000);
-                v = self.s.m.bin(c, Bin::And, v, field);
-            }
+            let v = self.as_int(f);
             self.write(inst, Reg::S(code + k as u8), v, None);
         }
         Ok(())
