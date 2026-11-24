@@ -5578,7 +5578,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
+            return self.words_from_table(inst, site, code, count);
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -6149,6 +6149,56 @@ impl<'a> Lower<'a> {
         let phi = self.s.m.phi(join, self.s.t.i32);
         self.s.m.set_phi(phi, incoming);
         Ok(phi)
+    }
+
+    /// A descriptor nothing uses as one: the program reads its dwords as
+    /// numbers (HLSL's `GetDimensions` of a buffer reads the record count,
+    /// dword 2, and the stride field of dword 1). Each dword comes from the
+    /// host's table of console descriptors by heap slot
+    /// ([`super::shader::SLOT_WORDS`]); dword 1 keeps its stride field only
+    /// (its address bits are the console's and mean nothing here).
+    fn words_from_table(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
+        const WHY: Why = "a descriptor read only as data";
+        let address = self.scalar.get(&site).copied().ok_or(WHY)?;
+        // Every loaded dword lies in the slot of the first.
+        let at = address.offset % 32;
+        if at % 4 != 0 || at + 4 * count > 32 {
+            return Err(WHY);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(site, 0, false).map_err(|_| WHY)?;
+        // Inside the table whatever the index: a root view has no bounds.
+        let last = self.s.m.i32(super::shader::SLOT_WORDS_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let five = self.s.m.i32(5);
+        let base = self.s.m.bin(c, Bin::Shl, slot, five);
+        let h = self.s.root_srv_handle(super::shader::SLOT_WORDS);
+        for k in 0..count {
+            let word = at / 4 + k;
+            let off = self.s.m.i32(4 * word);
+            let byte = self.s.m.bin(c, Bin::Add, base, off);
+            let iu = self.s.m.undef(self.s.t.i32);
+            let mask = self.s.m.i8(1);
+            let align = self.s.m.i32(4);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, byte, iu, mask, align],
+            );
+            let f = self.s.m.extract(c, r, 0);
+            let mut v = self.as_int(f);
+            if word == 1 {
+                let field = self.s.m.i32(0x3FFF_0000);
+                v = self.s.m.bin(c, Bin::And, v, field);
+            }
+            self.write(inst, Reg::S(code + k as u8), v, None);
+        }
+        Ok(())
     }
 
     /// The bytes per element of the buffer view `src` names, if the program

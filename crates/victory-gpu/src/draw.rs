@@ -961,6 +961,34 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_WORDS {
+                        // Ours: the console descriptors by view heap slot,
+                        // for a shader that reads a descriptor's dwords.
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|h| h.words_table());
+                        match table {
+                            // SAFETY: an open list, which holds the table.
+                            Some((buffer, gpu)) => unsafe {
+                                const ONCE: usize = usize::MAX - 0x5f;
+                                if list.first_use(ONCE) {
+                                    list.keep(buffer);
+                                }
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader reads descriptors of a view heap that is not set"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.

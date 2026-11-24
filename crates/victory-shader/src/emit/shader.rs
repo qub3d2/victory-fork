@@ -27,6 +27,19 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// The root SRV `t<SLOT_WORDS>` in [`ROOT_CBV_SPACE`] of a shader that
+/// loads a descriptor only to read its dwords as numbers (a buffer's
+/// record count for `GetDimensions`, say): a raw buffer the host keeps,
+/// [`SLOT_WORDS_DWORDS`] dwords per view heap slot, the console descriptor
+/// the title would hold for the view at that slot as far as the host view
+/// tells it (a buffer's title address, stride field, record count and
+/// identity channel order; zeros for what the host does not know).
+pub const SLOT_WORDS: u8 = 252;
+/// Dwords per slot of the [`SLOT_WORDS`] buffer: a console descriptor.
+pub const SLOT_WORDS_DWORDS: u32 = 8;
+/// Slots of the [`SLOT_WORDS`] buffer: heap indices are clamped to it.
+pub const SLOT_WORDS_COUNT: u32 = 1 << 20;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the

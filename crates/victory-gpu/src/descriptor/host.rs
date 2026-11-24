@@ -54,6 +54,9 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the table of console descriptors by title slot
+    /// (`victory_shader::emit::SLOT_WORDS`), as `strides`.
+    words: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -482,6 +485,73 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// Bytes of a view heap's table of console descriptors.
+const WORDS_BYTES: u64 = victory_shader::emit::SLOT_WORDS_COUNT as u64
+    * victory_shader::emit::SLOT_WORDS_DWORDS as u64
+    * 4;
+
+/// The console descriptor (eight dwords) the title would hold for `view`,
+/// as far as the host view tells it: a buffer's title address, its stride
+/// field (dword 1 bits 16..30: the structure stride or a typed view's
+/// element size, 0 for raw views), its record count (dword 2: elements, or
+/// bytes for raw views) and identity channel order. Programs that load a
+/// descriptor only to read such fields as numbers get them from the table
+/// (`victory_shader::emit::SLOT_WORDS`).
+// shortcut: views of textures read as zeros (formats, sizes, tiling); the
+// translator takes image sizes from the host view itself.
+fn console_words(view: &View) -> [u32; 8] {
+    /// DST_SEL x, y, z, w = X, Y, Z, W (dword 3 bits 0..11).
+    const IDENTITY: u32 = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    const BUFFER: u32 = 1;
+    let buffer = |address: u64, records: u32, stride: u32| {
+        [
+            address as u32,
+            (address >> 32) as u32 & 0xFFFF | (stride & 0x3FFF) << 16,
+            records,
+            IDENTITY,
+            0,
+            0,
+            0,
+            0,
+        ]
+    };
+    let (words, unordered): (&[u32; 10], bool) = match view {
+        View::Constant(address, size) => return buffer(*address, *size, 0),
+        View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+            let Ok(w) = d[..10].try_into() else {
+                return [0; 8];
+            };
+            (w, *unordered)
+        }
+        _ => return [0; 8],
+    };
+    // SAFETY: buffer views' union members.
+    let (elements, structure, raw) = unsafe {
+        if unordered {
+            let b = uav_desc(words).Anonymous.Buffer;
+            (
+                b.NumElements,
+                b.StructureByteStride,
+                b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0,
+            )
+        } else {
+            let b = srv_desc(words).Anonymous.Buffer;
+            (
+                b.NumElements,
+                b.StructureByteStride,
+                b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
+            )
+        }
+    };
+    let raw = structure == 0 && raw;
+    let records = if raw { elements.saturating_mul(4) } else { elements };
+    let stride = if raw { 0 } else { view_stride(view).unwrap_or(0) };
+    let address = buffer_range(view).map_or(0, |(a, _)| a);
+    buffer(address, records, stride)
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -619,6 +689,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let words = (!sampler)
+            .then(|| {
+                let bytes = WORDS_BYTES;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "console descriptors by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -632,6 +715,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            words,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -783,6 +867,12 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The table of console descriptors by title slot (view heaps): its
+    /// buffer, for a list to hold, and its GPU address.
+    pub(crate) fn words_table(&self) -> Option<(&ID3D12Resource, u64)> {
+        self.words.as_ref().map(|w| (&w.0, w.1))
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1042,6 +1132,19 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        if let Some((_, _, data)) = &self.words
+            && index < victory_shader::emit::SLOT_WORDS_COUNT
+        {
+            let words = view.map_or([0; 8], console_words);
+            // SAFETY: inside the mapping; shaders read it while we write
+            // (dword by dword, as the title's own descriptor writes are).
+            unsafe {
+                let at = (*data as *mut u32).add(index as usize * 8);
+                for (k, w) in words.into_iter().enumerate() {
+                    at.add(k).write_volatile(w);
+                }
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
