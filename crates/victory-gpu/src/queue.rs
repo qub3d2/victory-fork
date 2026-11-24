@@ -705,12 +705,43 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// A title buffer copy whose source shaders of the same list write
+    /// (`HostList::defer_copy`): `bytes` bytes of title memory at this
+    /// address, taken when the list has run and its shaders' writes are
+    /// back in title memory.
+    Copy(usize),
 }
 
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+        if let Written::Copy(from) = self {
+            #[cfg(windows)]
+            {
+                crate::host::copy_mapped(at, from as *const u8, bytes, true);
+                crate::watch::wrote(at as usize, bytes);
+                #[cfg(feature = "diagnostics")]
+                {
+                    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let k = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k < 64 && bytes == 8 {
+                        // SAFETY: just written.
+                        let v = unsafe { at.cast::<u64>().read_unaligned() };
+                        tracing::info!(
+                            from = format_args!("{from:#x}"),
+                            to = format_args!("{:#x}", at as usize),
+                            value = format_args!("{v:#x}"),
+                            "a copy made after its list: the value"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = from;
+            return;
+        }
         let value = match self {
+            Written::Copy(_) => unreachable!(),
             Written::Value(v) => v,
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

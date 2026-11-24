@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -4909,6 +4909,39 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        // The copy runs on the CPU at submission, before the card runs
+        // anything of the list: a source that a dispatch recorded earlier in
+        // the list writes would be copied as it was before the dispatch. Such
+        // a copy is made when the list has run, after its shaders' writes
+        // are back in title memory, with its bottom-of-pipe writes (the
+        // structure builder's results are copied out this way, 8 bytes at a
+        // time, into the title's own records). shortcut: a later dispatch
+        // of the same list that reads the destination sees it as before.
+        // `VICTORY_COPY_AFTER=0` copies at submission, as before.
+        let (s, e) = (src as usize, src as usize + len);
+        let after = copy_after()
+            && deferred
+                .copies
+                .iter()
+                .any(|step| matches!(step, Step::GpuWrite(_, a, n) if *a < e && s < a + n));
+        if after {
+            #[cfg(feature = "diagnostics")]
+            {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                let k = SAID.fetch_add(1, Ordering::Relaxed);
+                if k < 4 || k.is_power_of_two() {
+                    tracing::info!(
+                        src = format_args!("{s:#x}"),
+                        dst = format_args!("{:#x}", dst as usize),
+                        len,
+                        count = k + 1,
+                        "a buffer copy reads memory a dispatch earlier in its list writes: made when the list has run"
+                    );
+                }
+            }
+            deferred.writes.push((dst as usize, crate::queue::Written::Copy(s), len));
+            return;
+        }
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -6545,4 +6578,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             before.as_secs_f64() / after.as_secs_f64()
         );
     }
+}
+
+/// Whether a title buffer copy whose source the list's shaders write is
+/// made when the list has run (`HostList::defer_copy`; on unless
+/// `VICTORY_COPY_AFTER=0`).
+fn copy_after() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_AFTER").is_none_or(|v| v != "0"))
 }
