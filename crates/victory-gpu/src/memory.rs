@@ -75,6 +75,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// New copies by what named them (see [`Memory::map_for`]).
+    why: [u32; 4],
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,12 +113,20 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            why: [0; 4],
         })
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
     /// is the title's.
     fn map(&mut self, address: u64) {
+        self.map_for(address, 0);
+    }
+
+    /// [`Self::map`], counting a new copy under `why` (diagnostics: 0 a
+    /// fault or root view, 1 the cell after, 2 a pair of constants, 3 a
+    /// constant in 256-byte units).
+    fn map_for(&mut self, address: u64, why: usize) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
@@ -156,7 +166,19 @@ impl Memory {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
+                self.why[why.min(3)] += 1;
                 let n = self.copies.len() - 1;
+                if self.copies.len().is_power_of_two() || self.copies.len() % 64 == 0 {
+                    let bytes: u64 = self.copies.iter().map(|c| c.span().1).sum();
+                    tracing::info!(
+                        copies = self.copies.len(),
+                        mb = bytes >> 20,
+                        latest = format_args!("{:#x}+{:#x}", shadow.span().0, shadow.span().1),
+                        asked = format_args!("{address:#x}"),
+                        by = ?self.why,
+                        "title memory by address: copies numbered"
+                    );
+                }
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -227,10 +249,20 @@ impl Memory {
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    fn name(&mut self, address: u64, why: usize) {
+        self.map_for(address, why);
+        self.map_for((address & !(CELL - 1)) + CELL, if why == 0 { 1 } else { why });
     }
+}
+
+/// Whether a root constant is also taken for a title address in 256-byte
+/// units (`VICTORY_BY_ADDRESS_UNITS=0` turns that guess off: in a world
+/// frame it named about 400 of the 900 copies the builder pinned in its
+/// first second, 3.8 GB of copies and a process of 20 GB; what a stage
+/// really reaches that way is then picked up from its faults).
+fn units() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BY_ADDRESS_UNITS").is_none_or(|v| v != "0"))
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -258,7 +290,7 @@ pub(crate) fn ready(
         m.take_faults();
     }
     for &address in addresses {
-        m.name(address);
+        m.name(address, 0);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -268,10 +300,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, 2);
         }
-        if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+        if units() && c >= 0x0100_0000 {
+            m.name(u64::from(c) << 8, 3);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
