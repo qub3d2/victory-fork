@@ -173,11 +173,12 @@ pub fn group_sync() -> u8 {
 /// structure builder dispatches in threads (`DispatchX` with flag 0x20), and
 /// its refit stages count the lanes of EXEC to find where their input lists
 /// start. Only compute programs with a spilled user-data table (the builder's)
-/// are translated so. `VICTORY_THREAD_LIMIT=1`. Part of the translation: the shader cache
-/// keys on it (`victory-gpu`'s does).
+/// are translated so. On by default; `VICTORY_THREAD_LIMIT=0` turns it off
+/// (every lane of the last group runs, as before). Part of the translation:
+/// the shader cache keys on it (`victory-gpu`'s does).
 pub fn thread_limit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_none_or(|v| v != "0"))
 }
 
 /// The clean-up passes that run over a translated program before it is

@@ -75,6 +75,10 @@ fn build() -> &'static [u8; 32] {
                     }
                     bytes.push(0);
                 }
+                // Whether builder programs mask lanes past the thread count
+                // (on unless `VICTORY_THREAD_LIMIT=0`): the value in force, not
+                // only the variable, since its default changed.
+                bytes.push(u8::from(victory_shader::emit::thread_limit()));
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
