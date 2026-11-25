@@ -1032,6 +1032,7 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
+            unknown = format_args!("{:#x?}", super::xmem::unknown_pages(pages)),
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)

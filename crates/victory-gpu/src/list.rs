@@ -1313,33 +1313,30 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a dispatch with console flags (the
+/// ray-tracing structure builder dispatches this way). Flag 0x20: `x` counts
+/// threads, not groups. The other bits seen (0x8000) are not known; the
+/// host ignores them.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    // Each flag value once (diagnostics), to spot bits not seen before.
     #[cfg(feature = "diagnostics")]
     {
         static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let new = {
-            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-            !seen.contains(&_flags) && {
-                seen.push(_flags);
-                true
-            }
-        };
-        if new || SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
-            tracing::info!(x, y, z, flags = format_args!("{_flags:#x}"), "DispatchX");
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&flags) {
+            seen.push(flags);
+            tracing::info!(x, y, z, flags = format_args!("{flags:#x}"), "DispatchX: flags not seen before");
         }
     }
     #[cfg(windows)]
-    if _flags & 0x20 != 0 {
+    if flags & 0x20 != 0 {
         state::dispatch_in_threads(this, x, y, z);
     } else {
         state::dispatch(this, x, y, z);
     }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }

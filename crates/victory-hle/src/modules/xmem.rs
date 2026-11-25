@@ -558,6 +558,13 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// The pages of `pages` that are not physical pages we handed out (or that
+/// were freed since), at most four, for diagnostics.
+pub(crate) fn unknown_pages(pages: &[usize]) -> Vec<usize> {
+    let physical = physical();
+    pages.iter().copied().filter(|p| !physical.pages.contains_key(p)).take(4).collect()
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
