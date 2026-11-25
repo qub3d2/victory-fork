@@ -285,22 +285,35 @@ pub(crate) fn builder_off(why: &'static str) {
 /// the stages from the k-th on, counted from 0 in the order the title
 /// first dispatches them (each is logged with its number), to find the
 /// first stage whose output the title does not survive.
-/// `VICTORY_BVH_DRY_ONLY=<k>`: that stage alone.
+/// `VICTORY_BVH_DRY_ONLY=<k>`: that stage alone. `VICTORY_BVH_LIVE=<list>`
+/// (stages and ranges, as `20,23-26`): those stages stay live whatever the
+/// others say.
 #[cfg(windows)]
 pub(crate) fn builder_dry(this: This) -> bool {
-    static MODE: OnceLock<(bool, Option<usize>, Option<usize>)> = OnceLock::new();
+    static MODE: OnceLock<(bool, Option<usize>, Option<usize>, Vec<(usize, usize)>)> = OnceLock::new();
     static ORDER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
     if !is_builder(this) {
         return false;
     }
     let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse().ok());
-    let (all, from, only) = *MODE.get_or_init(|| {
+    let (all, from, only, live) = MODE.get_or_init(|| {
+        let live = std::env::var("VICTORY_BVH_LIVE")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|part| {
+                let (a, b) = part.split_once('-').unwrap_or((part, part));
+                Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            })
+            .collect();
         (
             std::env::var_os("VICTORY_BVH_DRY").is_some_and(|v| v == "1"),
             number("VICTORY_BVH_DRY_FROM"),
             number("VICTORY_BVH_DRY_ONLY"),
+            live,
         )
     });
+    let (all, from, only) = (*all, *from, *only);
+    let is_live = |at: usize| live.iter().any(|&(a, b)| a <= at && at <= b);
     if all {
         return true;
     }
@@ -314,12 +327,12 @@ pub(crate) fn builder_dry(this: This) -> bool {
             order.push(this as usize);
             let at = order.len() - 1;
             let name = host_pipeline(this).map(|p| p.name.clone()).unwrap_or_default();
-            let dry = from.is_some_and(|k| at >= k) || only == Some(at);
+            let dry = (from.is_some_and(|k| at >= k) || only == Some(at)) && !is_live(at);
             tracing::info!(stage = at, dry, name, "a stage of the structure builder, in the order of first dispatch");
             at
         }
     };
-    from.is_some_and(|k| at >= k) || only == Some(at)
+    (from.is_some_and(|k| at >= k) || only == Some(at)) && !is_live(at)
 }
 
 /// Whether the builder has run whole at least once (diagnostics).
