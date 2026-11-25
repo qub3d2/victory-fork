@@ -317,7 +317,7 @@ pub(crate) fn builder_dry(this: This) -> bool {
     if all {
         return true;
     }
-    if from.is_none() && only.is_none() {
+    if from.is_none() && only.is_none() && !cfg!(feature = "diagnostics") {
         return false;
     }
     let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -332,7 +332,20 @@ pub(crate) fn builder_dry(this: This) -> bool {
             at
         }
     };
+    STAGE_NOW.store(at, std::sync::atomic::Ordering::Relaxed);
     (from.is_some_and(|k| at >= k) || only == Some(at)) && !is_live(at)
+}
+
+/// The number of the builder stage `builder_dry` was last asked about
+/// (diagnostics; with the stages numbered, which diagnostics builds do).
+#[cfg(windows)]
+static STAGE_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The number of the builder stage `builder_dry` was last asked about.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn builder_stage_now() -> Option<usize> {
+    let at = STAGE_NOW.load(std::sync::atomic::Ordering::Relaxed);
+    (at != usize::MAX).then_some(at)
 }
 
 /// Whether the builder has run whole at least once (diagnostics).

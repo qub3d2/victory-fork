@@ -1756,6 +1756,30 @@ impl State {
         if crate::pipeline::builder_dry(self.pipeline as This) {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_builder(self.pipeline as This)
+            && let Some(at) = crate::pipeline::builder_stage_now()
+        {
+            let roots = self.roots_ref(true);
+            let constants = roots
+                .iter()
+                .find_map(|r| match r {
+                    Root::Constants(c) => Some(c.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let views = roots
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, r)| match r {
+                    Root::View(a) => Some((slot as u8, *a)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(n) = crate::bvhdump::ask(at, [x, y, z], constants, views) {
+                list.defer_write(std::ptr::null_mut(), crate::queue::Written::Dump(n), 0);
+            }
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);

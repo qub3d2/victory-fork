@@ -780,3 +780,84 @@ fn an_exclusive_prefix_sum_over_a_wave_with_scattered_inactive_lanes() {
     assert!(wrong.is_empty(), "(thread, got, expected): {wrong:?}");
     eprintln!("ran on the hardware device: the exclusive prefix sum over the active lanes");
 }
+
+/// The total of a value over a console wave as the compiler writes it: sums over groups of 2,
+/// 4 and 8 lanes (`dpp8`), over each row of 16 (`row_mirror`), over each 32 (`v_permlanex16`
+/// with lane selects 0), then the upper half's total (`v_readlane_b32` of lane 32) added to every
+/// lane and lane 0's sum read (`v_readlane_b32` of lane 0). Inactive lanes count 0 (`v_cndmask`
+/// under the saved EXEC, the sums under an EXEC of every lane). Thread t holds (t & 15) + 1; each
+/// active thread stores the total at dword t.
+#[test]
+fn a_total_over_a_wave_with_scattered_inactive_lanes() {
+    let words: Vec<u32> = vec![
+        0x3614_008F, // v_and_b32 v10, 15, v0
+        0x4A14_1481, // v_add_nc_u32 v10, 1, v10
+        0x3616_0085, // v_and_b32 v11, 5, v0
+        0x7DAA_1680, // v_cmpx_ne_u32 exec, 0, v11
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001,
+        0x0032_1480, // v_cndmask_b32 v1, 0, v10, s[12:13]
+        0x4A02_02E9,
+        0xDE54_C101, // v_add_nc_u32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x4A02_02E9,
+        0x9360_1201, // v_add_nc_u32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        0x4A02_02E9,
+        0x0009_2401, // v_add_nc_u32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+        0x4A02_02FA,
+        0xFF09_4001, // v_add_nc_u32 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002,
+        0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+        0xD760_000E,
+        0x0001_4101, // v_readlane_b32 s14, v1, 32
+        0x4A02_020E, // v_add_nc_u32 v1, s14, v1
+        0xD760_0029,
+        0x0001_0101, // v_readlane_b32 s41, v1, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E04_0229, // v_mov_b32 v2, s41
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::take_needs();
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let active = |t: u32| t & 5 != 0;
+    let total: u32 = (0..64u32).filter(|&t| active(t)).map(|t| (t & 15) + 1).sum();
+    let wrong: Vec<(u32, u32)> = (0..64u32)
+        .filter(|&t| active(t) && out[0][t as usize] != total)
+        .map(|t| (t, out[0][t as usize]))
+        .collect();
+    assert!(wrong.is_empty(), "total {total}; (thread, got): {wrong:?}");
+    eprintln!("ran on the hardware device: the total over the active lanes");
+}

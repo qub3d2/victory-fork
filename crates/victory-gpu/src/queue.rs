@@ -710,11 +710,22 @@ pub(crate) enum Written {
     /// address, taken when the list has run and its shaders' writes are
     /// back in title memory.
     Copy(usize),
+    /// Diagnostics: a dispatch of the structure builder to save once its
+    /// list has run (`bvhdump`); writes nothing.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    Dump(u32),
 }
 
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+        if let Written::Dump(n) = self {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::bvhdump::after(n);
+            #[cfg(not(all(windows, feature = "diagnostics")))]
+            let _ = n;
+            return;
+        }
         if let Written::Copy(from) = self {
             #[cfg(windows)]
             {
@@ -741,7 +752,7 @@ impl Written {
             return;
         }
         let value = match self {
-            Written::Copy(_) => unreachable!(),
+            Written::Copy(_) | Written::Dump(_) => unreachable!(),
             Written::Value(v) => v,
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();

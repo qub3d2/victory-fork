@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
+mod bvhdump;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
