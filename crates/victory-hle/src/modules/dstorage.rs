@@ -931,6 +931,27 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
+            // The kernel would not write the destination: a block of it was
+            // guarded again (`victory_gpu`'s guard on title memory, by a
+            // texture refresh on another thread) after `kernel_will_write`
+            // opened it. Read into our own memory and copy it in; a write of
+            // ours faults into the guard's handler as the title's do.
+            Err(error) if matches!(error.raw_os_error(), Some(998 | 1784)) => {
+                let mut bounce = vec![0; out.len() - done];
+                let mut got = 0;
+                while got < bounce.len() {
+                    match file.seek_read(&mut bounce[got..], request.offset + (done + got) as u64) {
+                        Ok(0) => break,
+                        Ok(n) => got += n,
+                        Err(_) => break,
+                    }
+                }
+                if got < bounce.len() {
+                    break Err(from_win32(&error));
+                }
+                out[done..].copy_from_slice(&bounce);
+                done = out.len();
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };
