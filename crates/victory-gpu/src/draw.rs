@@ -1710,18 +1710,20 @@ impl State {
 
     /// Runs a dispatch on the host.
     /// A dispatch the title gives in threads along x (`DispatchX` with flag
-    /// 0x20, the structure builder's): with `emit::thread_limit`, `x` groups
-    /// (at least the groups the threads fill) whose lanes from thread `x` on
-    /// are outside EXEC on entry, as the console runs it.
-    /// shortcut: `x` groups, not `x` threads rounded up to whole groups: the
-    /// host does not keep the program's group size; the groups past the
-    /// threads have no lane in EXEC.
+    /// 0x20, the structure builder's): with `emit::thread_limit`, the groups
+    /// the `x` threads fill (`x` over the program's group width, rounded up),
+    /// whose lanes from thread `x` on are outside EXEC on entry, as the
+    /// console runs it. A program whose group size is not known gets `x`
+    /// groups (those past the threads have no lane in EXEC).
     pub(crate) fn dispatch_in_threads(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         if !victory_shader::emit::thread_limit() {
             return self.dispatch(list, x, y, z);
         }
+        let width = crate::pipeline::host_pipeline(self.pipeline as This)
+            .and_then(|p| p.stages.iter().find_map(|s| s.translated().threads))
+            .map_or(1, |t| t[0].max(1));
         self.thread_limit = Some(x);
-        self.dispatch(list, x, y, z);
+        self.dispatch(list, x.div_ceil(width), y, z);
         self.thread_limit = None;
     }
 
