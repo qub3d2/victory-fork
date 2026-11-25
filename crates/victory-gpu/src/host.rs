@@ -1605,6 +1605,9 @@ struct Deferred {
     /// for reads, since the last step that wrote title memory).
     memory_read_seen: usize,
     memory_write_seen: usize,
+    /// Copies made on the card from a window to a buffer's copy inside it
+    /// ([`HostList::sync_aliased`]): the reader, the writer's step.
+    synced: std::collections::HashSet<(usize, usize)>,
 }
 
 impl Deferred {
@@ -3650,6 +3653,29 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // A list that reads, through one host copy, title memory that a
+        // list before it writes through another (a title buffer's copy and
+        // the window around it): the copies are refreshed before the card
+        // runs anything, so the reader would see the bytes from before. The
+        // lists before it run first, their writes go back to title memory,
+        // and the rest is submitted after (`VICTORY_SPLIT_ALIASED=0`: one
+        // submission, as before).
+        if runs.len() > 1
+            && split_aliased()
+            && let Some(at) = aliased_reader(runs)
+        {
+            #[cfg(feature = "diagnostics")]
+            {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                let k = SAID.fetch_add(1, Ordering::Relaxed);
+                if k < 10 || k.is_power_of_two() {
+                    tracing::info!(at, lists = runs.len(), count = k + 1, "a submission split: a list reads through one host copy what a list before it writes through another");
+                }
+            }
+            self.execute(&runs[..at]);
+            self.execute(&runs[at..]);
+            return;
+        }
         let _ = self.submit(runs, false);
     }
 
@@ -3991,6 +4017,44 @@ impl Host {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+        }
+        // Diagnostics: a range one host copy's shaders write, read in the
+        // same submission through another host copy of the same title
+        // memory (a title buffer's copy and a window over it): refreshed
+        // before the card runs, the second copy holds the bytes from before.
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut written: Vec<(usize, usize, usize, usize)> = Vec::new();
+            for (li, list) in runs.iter().enumerate() {
+                for step in &list.deferred().copies {
+                    match step {
+                        Step::GpuWrite(shadow, a, n) => {
+                            written.push((std::sync::Arc::as_ptr(shadow) as usize, *a, a + n, li))
+                        }
+                        Step::Refresh(shadow, a, n) => {
+                            let me = std::sync::Arc::as_ptr(shadow) as usize;
+                            if let Some(&(other, ws, we, wl)) =
+                                written.iter().find(|&&(o, ws, we, _)| o != me && ws < a + n && *a < we)
+                            {
+                                static SAID: AtomicU64 = AtomicU64::new(0);
+                                let k = SAID.fetch_add(1, Ordering::Relaxed);
+                                if k < 30 || k.is_power_of_two() {
+                                    tracing::warn!(
+                                        read = format_args!("{a:#x}+{n:#x}"),
+                                        written = format_args!("{ws:#x}..{we:#x}"),
+                                        reader = format_args!("{:#x}+{:#x}", shadow.span().0, shadow.span().1),
+                                        same_list = wl == li,
+                                        count = k + 1,
+                                        writer_copy = other,
+                                        "a host copy is read in a submission after shaders write the same title memory through another host copy"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         // A copy of one list whose source a dispatch of a list before it in
         // this submission writes: made when the lists have run, as within a
@@ -5054,11 +5118,102 @@ impl HostList {
                 }
             }
         }
+        if sync_aliased() && !shadow.is_window() {
+            self.sync_aliased(&mut deferred, shadow, address, len);
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+        }
+    }
+
+    /// A buffer's host copy read at `[address, address + len)` after shaders
+    /// earlier in the list wrote the same title memory through a window
+    /// over it (`crate::memory` gives a 64 KiB page to the window when a
+    /// buffer smaller than the page lies in it): the two are different
+    /// host resources, and what was written reaches the buffer's copy only
+    /// through title memory once the whole submission has run. The written
+    /// bytes are copied from the window into the buffer's copy here, on
+    /// the card, between the writer and the reader. Only when no write to
+    /// the buffer's own copy of those bytes comes after the window's in the
+    /// list (a window's write step stands for every dispatch that may write
+    /// it, not only for bytes written). `VICTORY_SYNC_ALIASED=0` turns it off.
+    fn sync_aliased(
+        &self,
+        deferred: &mut Deferred,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let reader = std::sync::Arc::as_ptr(shadow) as usize;
+        let (s, e) = (address, address + len);
+        let mut copies = Vec::new();
+        for (i, step) in deferred.copies.iter().enumerate() {
+            let Step::GpuWrite(w, a, n) = step else { continue };
+            if std::sync::Arc::ptr_eq(w, shadow) || !w.is_window() {
+                continue;
+            }
+            let (ws, wl) = w.span();
+            let lo = s.max(*a).max(ws as usize);
+            let hi = e.min(a + n).min((ws + wl) as usize);
+            if lo >= hi || deferred.synced.contains(&(reader, i)) {
+                continue;
+            }
+            let own_later = deferred.copies[i + 1..].iter().any(|later| {
+                matches!(later, Step::GpuWrite(o, oa, on)
+                    if std::sync::Arc::ptr_eq(o, shadow) && *oa < hi && lo < oa + on)
+            });
+            if own_later {
+                continue;
+            }
+            copies.push((i, w.clone(), lo, hi));
+        }
+        if copies.is_empty() {
+            return;
+        }
+        let uav = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // SAFETY: an open list; live buffers (both copies are held by the
+        // list's steps).
+        unsafe {
+            self.list.ResourceBarrier(std::slice::from_ref(&uav));
+            for (_, w, lo, hi) in &copies {
+                self.list.CopyBufferRegion(
+                    &shadow.buffer,
+                    shadow.offset(*lo as u64),
+                    &w.buffer,
+                    w.offset(*lo as u64),
+                    (hi - lo) as u64,
+                );
+            }
+            self.list.ResourceBarrier(std::slice::from_ref(&uav));
+        }
+        for (i, w, lo, hi) in copies {
+            deferred.synced.insert((reader, i));
+            #[cfg(feature = "diagnostics")]
+            {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                let k = SAID.fetch_add(1, Ordering::Relaxed);
+                if k < 20 || k.is_power_of_two() {
+                    tracing::info!(
+                        read = format_args!("{lo:#x}..{hi:#x}"),
+                        window = format_args!("{:#x}+{:#x}", w.span().0, w.span().1),
+                        count = k + 1,
+                        "a buffer's copy read after its list wrote the window over it: the bytes copied across on the card"
+                    );
+                }
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = (w, lo, hi);
         }
     }
 
@@ -6660,4 +6815,46 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 fn copy_after() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_AFTER").is_none_or(|v| v != "0"))
+}
+
+/// Whether a submission is split where a list reads through one host copy
+/// what an earlier list writes through another (`Host::execute`; on unless
+/// `VICTORY_SPLIT_ALIASED=0`).
+/// Whether a buffer's copy read after its list wrote a window over it is
+/// first brought up to date on the card ([`HostList::sync_aliased`]): on
+/// unless `VICTORY_SYNC_ALIASED=0`.
+fn sync_aliased() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SYNC_ALIASED").map_or(true, |v| v != "0"))
+}
+
+fn split_aliased() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_ALIASED").is_none_or(|v| v != "0"))
+}
+
+/// The first list of `runs` (after the first) that refreshes a range of a
+/// host copy which shaders of an earlier list write through another host
+/// copy of the same title memory.
+fn aliased_reader(runs: &[&HostList]) -> Option<usize> {
+    let mut written: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, list) in runs.iter().enumerate() {
+        let deferred = list.deferred();
+        if i > 0 {
+            for step in &deferred.copies {
+                if let Step::Refresh(shadow, a, n) = step {
+                    let me = std::sync::Arc::as_ptr(shadow) as usize;
+                    if written.iter().any(|&(o, ws, we)| o != me && ws < a + n && *a < we) {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        for step in &deferred.copies {
+            if let Step::GpuWrite(shadow, a, n) = step {
+                written.push((std::sync::Arc::as_ptr(shadow) as usize, *a, a + n));
+            }
+        }
+    }
+    None
 }

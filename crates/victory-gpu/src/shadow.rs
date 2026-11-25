@@ -1660,6 +1660,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the copy is a window over memory outside buffer objects.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
