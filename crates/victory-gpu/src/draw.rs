@@ -149,6 +149,9 @@ fn windows() -> bool {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The thread count along x of the dispatch being recorded, when the
+    /// title gave it in threads (`dispatch_in_threads`).
+    thread_limit: Option<u32>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -679,7 +682,10 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == USER_THREAD_LIMIT {
+            return self.thread_limit.unwrap_or(u32::MAX);
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -1703,6 +1709,22 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
+    /// A dispatch the title gives in threads along x (`DispatchX` with flag
+    /// 0x20, the structure builder's): with `emit::thread_limit`, `x` groups
+    /// (at least the groups the threads fill) whose lanes from thread `x` on
+    /// are outside EXEC on entry, as the console runs it.
+    /// shortcut: `x` groups, not `x` threads rounded up to whole groups: the
+    /// host does not keep the program's group size; the groups past the
+    /// threads have no lane in EXEC.
+    pub(crate) fn dispatch_in_threads(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if !victory_shader::emit::thread_limit() {
+            return self.dispatch(list, x, y, z);
+        }
+        self.thread_limit = Some(x);
+        self.dispatch(list, x, y, z);
+        self.thread_limit = None;
+    }
+
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;

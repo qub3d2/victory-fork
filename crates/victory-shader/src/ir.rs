@@ -51,6 +51,11 @@ pub struct Program {
     /// hardware or a called fetch routine set up (user SGPRs, system values,
     /// vertex inputs).
     pub inputs: Vec<(Reg, Value)>,
+    /// A compute program whose EXEC on entry holds only the lanes inside
+    /// the dispatch's thread count ([`crate::structure::Atom::Dispatched`]):
+    /// the console runs a dispatch given in threads as whole groups whose
+    /// lanes past the count are outside EXEC (`emit::thread_limit`).
+    pub dispatched: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,6 +549,7 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
         vgprs,
         blocks,
         inputs,
+        dispatched: false,
     }
 }
 
@@ -577,7 +583,7 @@ pub(crate) fn thread_edges(
     }
     link(&mut blocks);
     split_irreducible(&mut blocks)?;
-    Ok(rename(blocks, p.wave64, p.vgprs))
+    Ok(Program { dispatched: p.dispatched, ..rename(blocks, p.wave64, p.vgprs) })
 }
 
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
@@ -614,7 +620,7 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     }
     link(&mut blocks);
     split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    Some(Program { dispatched: p.dispatched, ..rename(blocks, p.wave64, p.vgprs) })
 }
 
 /// As [`without_early_outs`], and also without the branches that only skip a
@@ -769,7 +775,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     }
     link(&mut blocks);
     split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    Some(Program { dispatched: p.dispatched, ..rename(blocks, p.wave64, p.vgprs) })
 }
 
 /// Placeholder before renaming.

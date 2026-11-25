@@ -90,6 +90,11 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// title memory: its raw accesses go by address ([`SLOT_MEMORY`]) from
 /// here, not through one view of the copy the address is in.
 pub const USER_ROOT_ADDRESS: u32 = 0x104;
+/// A `Root::Other` user-data dword the host computes: the dispatch's thread
+/// count along x when the title gave the dispatch in threads (lanes from it
+/// on are outside EXEC on entry), else `u32::MAX`. Only programs translated
+/// with `emit::thread_limit` read it.
+pub const USER_THREAD_LIMIT: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

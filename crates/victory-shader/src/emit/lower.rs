@@ -260,6 +260,8 @@ struct Lower<'a> {
     own_bits: super::own_bits::OwnBits,
     /// The console lane (0..63) of this thread, made in the entry block.
     clane: Option<V>,
+    /// Whether this thread is inside the dispatch's thread count (`dispatched`).
+    dispatched: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
@@ -1522,6 +1524,7 @@ impl<'a> Lower<'a> {
             },
             exchange,
             clane: None,
+            dispatched: None,
             pair: None,
             halves,
             wave_base: None,
@@ -3477,6 +3480,7 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Dispatched => Ok(self.dispatched()),
         }
     }
 
@@ -3507,6 +3511,38 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)
+    }
+
+    /// Whether this thread is inside the dispatch's thread count (EXEC on entry of a
+    /// `dispatched` program, `shader.rs` `USER_THREAD_LIMIT`): along x, the group's first
+    /// thread plus the console thread index in the group (a group of one dimension), else
+    /// the host's dispatch thread index.
+    fn dispatched(&mut self) -> V {
+        use super::shader::USER_THREAD_LIMIT;
+        if let Some(v) = self.dispatched {
+            return v;
+        }
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let threads = match self.x.native.io {
+            StageIo::Cs(cs) => cs.threads,
+            _ => [1, 1, 1],
+        };
+        let x = if threads[1] * threads[2] == 1 {
+            let zero = self.s.m.i32(0);
+            let group = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[zero]);
+            let tx = self.s.m.i32(threads[0]);
+            let first = self.s.m.bin(e, Bin::Mul, group, tx);
+            let t = self.console_thread();
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.bin(e, Bin::Add, first, t)
+        } else {
+            let zero = self.s.m.i32(0);
+            self.s.op(e, "threadId.i32", Attr::ReadNone, i32t, 93, &[zero])
+        };
+        let limit = self.host_word(RootType::Other(USER_THREAD_LIMIT), 0, 0);
+        let v = self.s.m.cmp(e, pred::IULT, x, limit);
+        self.dispatched = Some(v);
+        v
     }
 
     /// The console thread index of this thread in the group: `wave_base` plus the host lane

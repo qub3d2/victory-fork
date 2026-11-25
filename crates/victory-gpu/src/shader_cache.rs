@@ -66,6 +66,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
                     "VICTORY_ROOT_BY_ADDRESS",
+                    "VICTORY_THREAD_LIMIT",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');

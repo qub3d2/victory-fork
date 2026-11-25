@@ -1316,8 +1316,27 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let new = {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            !seen.contains(&_flags) && {
+                seen.push(_flags);
+                true
+            }
+        };
+        if new || SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+            tracing::info!(x, y, z, flags = format_args!("{_flags:#x}"), "DispatchX");
+        }
+    }
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if _flags & 0x20 != 0 {
+        state::dispatch_in_threads(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
         let _ = (this, x, y, z);
@@ -1588,6 +1607,11 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    /// A dispatch in threads along x (`DispatchX` flag 0x20).
+    pub(super) fn dispatch_in_threads(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch_in_threads(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.

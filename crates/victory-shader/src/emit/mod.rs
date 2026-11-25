@@ -114,7 +114,7 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_WORDS, SLOT_WORDS_COUNT, SLOT_WORDS_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_WORDS, SLOT_WORDS_COUNT, SLOT_WORDS_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_THREAD_LIMIT, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
 
@@ -166,6 +166,18 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether a compute program's EXEC on entry holds only the lanes inside the
+/// dispatch's thread count ([`shader::USER_THREAD_LIMIT`]): the console's
+/// structure builder dispatches in threads (`DispatchX` with flag 0x20), and
+/// its refit stages count the lanes of EXEC to find where their input lists
+/// start. Only compute programs with a spilled user-data table (the builder's)
+/// are translated so. `VICTORY_THREAD_LIMIT=1`. Part of the translation: the shader cache
+/// keys on it (`victory-gpu`'s does).
+pub fn thread_limit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_LIMIT").is_some_and(|v| v == "1"))
 }
 
 /// The clean-up passes that run over a translated program before it is

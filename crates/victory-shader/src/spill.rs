@@ -28,6 +28,9 @@ const FIRST: u32 = 16;
 /// of a spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
     let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    // (the structure builder's programs, which keep their root parameters in a
+    // spilled user-data table: no other program gets the host word)
+    p.dispatched = crate::emit::thread_limit() && spilled(native).is_some();
     user_data(&mut p, native);
     Ok(p)
 }

@@ -50,6 +50,9 @@ pub enum Atom {
     Opaque(Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
+    /// The lane is inside the dispatch's thread count (EXEC on entry of a
+    /// [`crate::ir::Program::dispatched`] program).
+    Dispatched,
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -647,7 +650,8 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            let entry = if p.dispatched { self.b.atom(Atom::Dispatched, 0) } else { Bool::TRUE };
+            self.masks.insert((lo, hi), entry);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
