@@ -686,3 +686,97 @@ fn a_prefix_sum_over_a_group_of_eight_waves() {
     assert!(wrong.is_empty(), "(thread, got, expected): {wrong:?}");
     eprintln!("ran on the hardware device: the prefix sum of all 512 threads");
 }
+
+/// An exclusive prefix sum over one console wave as the console compiler expands
+/// `WavePrefixSum` for 64 lanes, with lanes inactive in a scattered pattern: inside a
+/// whole-wave section the inactive lanes take 0, `row_shr` DPP steps sum within each row of
+/// 16, the upper row of each 32 adds the lower row's last lane (`v_permlanex16` with
+/// fetch-inactive, under an EXEC of the upper rows only), the upper 32 lanes add lane 31
+/// (`v_readlane_b32`, under an EXEC of the upper half only), and the lane's own value is
+/// taken off. Thread t holds (t & 15) + 1; each active thread stores its prefix at dword t.
+#[test]
+fn an_exclusive_prefix_sum_over_a_wave_with_scattered_inactive_lanes() {
+    let words: Vec<u32> = vec![
+        0x3614_008F, // v_and_b32 v10, 15, v0
+        0x4A14_1481, // v_add_nc_u32 v10, 1, v10
+        0x3616_0085, // v_and_b32 v11, 5, v0
+        0x7DAA_1680, // v_cmpx_ne_u32 exec, 0, v11
+        0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+        0xD501_0001,
+        0x0032_1480, // v_cndmask_b32 v1, 0, v10, s[12:13]
+        0x7E04_0301, // v_mov_b32 v2, v1
+        0x4A04_04FA,
+        0xFF09_1102, // v_add_nc_u32 v2, v2, v2 row_shr:1 bound_ctrl:1
+        0x4A04_04FA,
+        0xFF01_1202, // v_add_nc_u32 v2, v2, v2 row_shr:2
+        0x4A04_04FA,
+        0xFF01_1402, // v_add_nc_u32 v2, v2, v2 row_shr:4
+        0x4A04_04FA,
+        0xFF01_1802, // v_add_nc_u32 v2, v2, v2 row_shr:8
+        0xBEFE_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0xBEFF_03FF,
+        0xFFFF_0000, // s_mov_b32 exec_hi, 0xffff0000
+        0xD778_4803,
+        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        0x4A04_0503, // v_add_nc_u32 v2, v3, v2
+        0xD760_000E,
+        0x0001_3F02, // v_readlane_b32 s14, v2, 31
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4A04_040E, // v_add_nc_u32 v2, s14, v2
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4C04_0302, // v_sub_nc_u32 v2, v2, v1
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::take_needs();
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return;
+        }
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let active = |t: u32| t & 5 != 0;
+    let mut sum = 0;
+    let mut wrong = Vec::new();
+    for t in 0..64u32 {
+        if active(t) {
+            if out[0][t as usize] != sum {
+                wrong.push((t, out[0][t as usize], sum));
+            }
+            sum += (t & 15) + 1;
+        }
+    }
+    assert!(wrong.is_empty(), "(thread, got, expected): {wrong:?}");
+    eprintln!("ran on the hardware device: the exclusive prefix sum over the active lanes");
+}
