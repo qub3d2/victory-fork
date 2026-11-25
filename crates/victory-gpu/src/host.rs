@@ -3992,6 +3992,18 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        // A copy of one list whose source a dispatch of a list before it in
+        // this submission writes: made when the lists have run, as within a
+        // list (`HostList::defer_copy`).
+        if copy_after() && runs.len() > 1 {
+            let mut written: Vec<(usize, usize)> = Vec::new();
+            for list in runs {
+                if !written.is_empty() {
+                    list.copies_after(&written);
+                }
+                written.extend(list.gpu_write_ranges());
+            }
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4906,6 +4918,48 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The title memory the list's shaders write, as `(start, end)`.
+    fn gpu_write_ranges(&self) -> Vec<(usize, usize)> {
+        self.deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::GpuWrite(_, a, n) => Some((*a, a + n)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Moves the list's copies whose source overlaps `written` (title
+    /// memory an earlier list of the submission writes) to when the list
+    /// has run (`queue::Written::Copy`).
+    fn copies_after(&self, written: &[(usize, usize)]) {
+        let mut deferred = self.deferred();
+        let d = &mut *deferred;
+        let mut moved = 0usize;
+        let mut kept = Vec::with_capacity(d.copies.len());
+        for step in d.copies.drain(..) {
+            if let Step::Copy(dst, src, len) = step
+                && written.iter().any(|&(a, e)| a < src + len && src < e)
+            {
+                d.writes.push((dst, crate::queue::Written::Copy(src), len));
+                moved += 1;
+                continue;
+            }
+            kept.push(step);
+        }
+        d.copies = kept;
+        #[cfg(feature = "diagnostics")]
+        if moved > 0 {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let k = SAID.fetch_add(1, Ordering::Relaxed);
+            if k < 20 || k.is_power_of_two() {
+                tracing::info!(moved, count = k + 1, "buffer copies that read what an earlier list of the submission writes: made when the lists have run");
+            }
+        }
+        let _ = moved;
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
@@ -4980,6 +5034,26 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        #[cfg(feature = "diagnostics")]
+        {
+            let (s, e) = (address, address + len);
+            let hit = deferred.writes.iter().find(|(at, what, n)| {
+                matches!(what, crate::queue::Written::Copy(_)) && *at < e && s < at + n
+            });
+            if let Some(&(at, what, n)) = hit {
+                static SAID: AtomicU64 = AtomicU64::new(0);
+                let k = SAID.fetch_add(1, Ordering::Relaxed);
+                if k < 20 || k.is_power_of_two() {
+                    tracing::warn!(
+                        read = format_args!("{s:#x}+{len:#x}"),
+                        copy_to = format_args!("{at:#x}+{n:#x}"),
+                        ?what,
+                        count = k + 1,
+                        "a dispatch reads memory a copy earlier in its list writes after the list has run: it reads the bytes from before the copy"
+                    );
+                }
+            }
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
